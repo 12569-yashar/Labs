@@ -1,5 +1,3 @@
-Aşağıdakı mətni birbaşa GitHub `README.md` və ya writeup kimi ata bilərsən. Flag-ləri tam yazmadım, GitHub üçün daha səliqəli belə yaxşıdır.
-
 ````markdown
 # HTB Linux Lab Writeup — Grafana CVE-2021-43798
 

